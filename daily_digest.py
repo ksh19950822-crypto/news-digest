@@ -4,6 +4,7 @@ import feedparser
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from google import genai
+from storage import init_db, save_digest
 
 # ── 1. RSS 소스 및 수집 로직 ──
 headers = {
@@ -144,15 +145,30 @@ def generate_with_retry(prompt, max_retries=3, wait_seconds=15):
 
 response = generate_with_retry(prompt)
 
+init_db()  # 테이블이 없으면 생성
+
+today_str_for_db = datetime.now().strftime("%Y-%m-%d")
+
 if response is not None:
     print(response.text)
     print(f"\n입력 토큰: {response.usage_metadata.prompt_token_count}")
     print(f"출력 토큰: {response.usage_metadata.candidates_token_count}")
+
+    save_digest(
+        digest_date=today_str_for_db,
+        content=response.text,
+        input_tokens=response.usage_metadata.prompt_token_count,
+        output_tokens=response.usage_metadata.candidates_token_count,
+        ai_success=True
+    )
 else:
-    # AI 요약이 끝내 실패하면, 최소한 원문 목록이라도 보여준다
     print("⚠️ AI 요약에 실패해 원문 목록으로 대체합니다.\n")
     print(summary_input)
 
-print(response.text)
-print(f"\n입력 토큰: {response.usage_metadata.prompt_token_count}")
-print(f"출력 토큰: {response.usage_metadata.candidates_token_count}")
+    save_digest(
+        digest_date=today_str_for_db,
+        content=summary_input,
+        input_tokens=None,
+        output_tokens=None,
+        ai_success=False
+    )
