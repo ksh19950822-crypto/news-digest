@@ -1,12 +1,16 @@
 import os
 import re
+import json
+import time
 import feedparser
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from google import genai
+from google.genai import errors
+
 from storage import init_db, save_digest
 
-# ── 1. RSS 소스 및 수집 로직 ──
+# ── 1. RSS 소스 ──
 headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
@@ -77,7 +81,6 @@ def group_articles(articles, threshold=0.3):
     return groups
 
 def get_top_stories(groups, top_n=15, min_sources=2):
-    """언론사 1곳만 다룬 그룹은 제외하고, 나머지를 언론사 수 기준으로 정렬"""
     filtered = [g for g in groups if len(set(a["source"] for a in g)) >= min_sources]
     sorted_groups = sorted(
         filtered,
@@ -88,46 +91,48 @@ def get_top_stories(groups, top_n=15, min_sources=2):
 
 # ── 3. RSS 수집 및 그룹핑 실행 ──
 lookback = get_lookback_days()
-articles = []
+articles_raw = []
 
 for name, url in sources.items():
     feed = feedparser.parse(url, request_headers=headers)
     for entry in feed.entries:
         if is_recent(entry, lookback):
-            articles.append({
+            articles_raw.append({
                 "source": name,
                 "title": entry.title,
                 "link": entry.link,
             })
 
-print(f"수집된 전체 기사 수: {len(articles)}개")
+print(f"수집된 전체 기사 수: {len(articles_raw)}개")
 
-groups = group_articles(articles, threshold=0.3)
-top_stories = get_top_stories(groups, top_n=15, min_sources=2)
+groups = group_articles(articles_raw, threshold=0.3)
+top_stories = get_top_stories(groups, top_n=30, min_sources=2)
 
 print(f"교차 언급된(2곳 이상) 사건 수: {len(top_stories)}개")
 print("=" * 50)
 
-# ── 4. Gemini에게 최종 요약 요청 (재시도 + 실패 시 대체 로직 포함) ──
-import time
-from google.genai import errors
-
+# ── 4. Gemini에게 구조화된(JSON) 요약 요청 ──
 load_dotenv()
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
-summary_input = ""
+items_input = ""
 for idx, group in enumerate(top_stories, 1):
-    sources_in_group = ", ".join(set(a["source"] for a in group))
-    summary_input += f"{idx}. [{sources_in_group}] {group[0]['title']}\n"
+    items_input += f"{idx}. {group[0]['title']}\n"
 
 today_str = datetime.now().strftime("%Y년 %m월 %d일")
 
 prompt = f"""오늘은 {today_str}입니다.
-아래는 오늘 국내 주요 언론사들이 공통으로 다룬 뉴스입니다.
-각 항목을 한두 문장으로 자연스럽게 요약해서, 아침에 읽기 좋은 뉴스레터 형식으로 정리해주세요.
-뉴스레터 제목에는 반드시 위에 명시된 오늘 날짜를 사용하세요.
+아래는 오늘 국내 주요 언론사들이 공통으로 다룬 뉴스 {len(top_stories)}건입니다.
+각 항목마다 정보를 만들어서, 반드시 JSON 배열 형식으로만 응답해주세요.
+다른 설명, 인사말, 코드블록 표시(```) 없이 순수 JSON 배열만 출력해야 합니다.
 
-{summary_input}
+각 객체는 아래 필드를 가져야 합니다:
+- index: 원본 번호 (정수)
+- category: "정치", "국제", "경제", "사회", "스포츠", "문화" 중 하나
+- headline: 다듬어진 헤드라인 (원문보다 간결하고 자연스럽게)
+- summary: 한두 문장 요약
+
+{items_input}
 """
 
 def generate_with_retry(prompt, max_retries=3, wait_seconds=15):
@@ -137,38 +142,69 @@ def generate_with_retry(prompt, max_retries=3, wait_seconds=15):
                 model="gemini-2.5-flash-lite",
                 contents=prompt
             )
+        except errors.ClientError as e:
+            if "RESOURCE_EXHAUSTED" in str(e) or "429" in str(e):
+                print("⚠️ 오늘의 무료 API 할당량을 모두 사용했습니다. 재시도 없이 바로 대체합니다.")
+                return None
+            else:
+                print(f"클라이언트 오류 발생: {e}")
+                return None
         except errors.ServerError as e:
             print(f"{attempt}번째 시도 실패, {wait_seconds}초 후 재시도합니다...")
             time.sleep(wait_seconds)
-            wait_seconds *= 2  # 대기 시간을 매번 2배씩 늘림
+            wait_seconds *= 2
     return None
 
 response = generate_with_retry(prompt)
 
-init_db()  # 테이블이 없으면 생성
-
-today_str_for_db = datetime.now().strftime("%Y-%m-%d")
+articles = None
 
 if response is not None:
-    print(response.text)
-    print(f"\n입력 토큰: {response.usage_metadata.prompt_token_count}")
-    print(f"출력 토큰: {response.usage_metadata.candidates_token_count}")
+    raw_text = response.text.strip()
+    raw_text = re.sub(r"^```(json)?|```$", "", raw_text, flags=re.MULTILINE).strip()
 
+    try:
+        summary_items = json.loads(raw_text)
+    except json.JSONDecodeError:
+        print("⚠️ Gemini 응답이 올바른 JSON 형식이 아닙니다. 원문 목록으로 대체합니다.")
+        summary_items = None
+
+    if summary_items is not None:
+        articles = []
+        for idx, group in enumerate(top_stories, 1):
+            item = next((s for s in summary_items if s.get("index") == idx), None)
+            if item is None:
+                continue
+            sources_in_group = sorted(set(a["source"] for a in group))
+            articles.append({
+                "category": item.get("category", "기타"),
+                "headline": item.get("headline", group[0]["title"]),
+                "summary": item.get("summary", ""),
+                "link": group[0]["link"],
+                "sources": ", ".join(sources_in_group),
+            })
+
+# ── 5. DB 저장 ──
+init_db()
+today_str_for_db = datetime.now().strftime("%Y-%m-%d")
+
+if articles is not None:
     save_digest(
         digest_date=today_str_for_db,
-        content=response.text,
+        content=items_input,
+        articles_json=json.dumps(articles, ensure_ascii=False),
         input_tokens=response.usage_metadata.prompt_token_count,
         output_tokens=response.usage_metadata.candidates_token_count,
         ai_success=True
     )
+    print(f"구조화된 요약 {len(articles)}건 저장 완료")
 else:
-    print("⚠️ AI 요약에 실패해 원문 목록으로 대체합니다.\n")
-    print(summary_input)
-
     save_digest(
         digest_date=today_str_for_db,
-        content=summary_input,
+        content=items_input,
+        articles_json=None,
         input_tokens=None,
         output_tokens=None,
         ai_success=False
     )
+    print("⚠️ AI 요약 실패 - 원문 목록으로 저장")
