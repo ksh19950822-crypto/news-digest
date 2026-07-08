@@ -210,10 +210,12 @@ else:
     print("⚠️ AI 요약 실패 - 원문 목록으로 저장")
     
 # ── 6. 이메일 발송 ──
+recipient = os.getenv("RECIPIENT_EMAIL", os.getenv("GMAIL_ADDRESS"))
+
 if articles is not None:
     email_html = render_email_html(digest_date=today_str_for_db, articles=articles)
     send_digest_email(
-        to_address=os.getenv("GMAIL_ADDRESS"),  # 본인에게 보내는 것이므로 주소가 동일
+        to_address=recipient,
         subject=f"[뉴스레터] {today_str_for_db} 아침 브리핑",
         html_content=email_html
     )
